@@ -1,9 +1,11 @@
 "use client";
 
 import { useState, useRef, useEffect, useCallback } from "react";
-import { Stage, Layer, Rect, Text } from 'react-konva'; // Import Konva components
+import { Stage, Layer, Rect, Text, Group } from 'react-konva'; // Import Konva components
+import Konva from 'konva'; // Import the Konva namespace for direct constructor use
 import { Play, Pause } from 'lucide-react'; // Using lucide-react for icons
 import { SubtitleTimeline } from './SubtitleTimeline'; // Import the timeline component
+import { useSubtitleStore } from '~/store/subtitleStore'; // Import the subtitle store
 
 // Helper function to format time
 const formatTime = (timeInSeconds: number): string => {
@@ -21,9 +23,47 @@ export function VideoPlayerWithKonva() {
   const [duration, setDuration] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false); // To prevent timeupdate flicker during seek
 
+  const subtitles = useSubtitleStore((state) => state.subtitles);
+  const updateSubtitleText = useSubtitleStore((state) => state.updateSubtitle); // Get update function
+
+  // State for inline editing of subtitles on the video
+  const [editingSubtitle, setEditingSubtitle] = useState<{
+    id: string;
+    text: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null); // Ref for the container
   const progressRef = useRef<HTMLInputElement>(null); // Ref for progress bar
+
+  // Log active subtitle for debugging Konva interaction
+  // This needs to be at the top level of the component
+  const activeSubtitleForKonva = subtitles.find(
+    (sub) => currentTime >= sub.start && currentTime < sub.end
+  );
+  useEffect(() => {
+    console.log('[VideoPlayerWithKonva] Current activeSubtitle for Konva area:', activeSubtitleForKonva);
+  }, [activeSubtitleForKonva, currentTime]); // Log when it changes or currentTime changes
+
+  const handleEditSave = () => {
+    if (editingSubtitle) {
+      updateSubtitleText(editingSubtitle.id, { text: editingSubtitle.text });
+      setEditingSubtitle(null);
+    }
+  };
+
+  const handleEditKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault(); // Prevent newline in textarea
+      handleEditSave();
+    } else if (event.key === 'Escape') {
+      setEditingSubtitle(null); // Discard changes
+    }
+  };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -225,7 +265,7 @@ export function VideoPlayerWithKonva() {
               />
               {videoDimensions.width > 0 && videoDimensions.height > 0 && (
                 <div 
-                  className="absolute top-0 left-0 pointer-events-none flex justify-center items-center"
+                  className="absolute top-0 left-0 flex justify-center items-center"
                   style={{ 
                     width: `${videoDimensions.width}px`, 
                     height: `${videoDimensions.height}px` 
@@ -233,27 +273,123 @@ export function VideoPlayerWithKonva() {
                 >
                   <Stage width={videoDimensions.width} height={videoDimensions.height}>
                     <Layer>
-                      <Rect
-                        x={20}
-                        y={videoDimensions.height - 60}
-                        width={videoDimensions.width - 40}
-                        height={40}
-                        fill="rgba(0,0,0,0.5)"
-                        cornerRadius={5}
-                      />
-                      <Text
-                        text="Example Subtitle Text Here"
-                        x={30}
-                        y={videoDimensions.height - 55}
-                        fontSize={20}
-                        fontFamily="Arial"
-                        fill="white"
-                        width={videoDimensions.width - 60}
-                        align="center"
-                      />
+                      {(() => {
+                        // Use the memoized/state-tracked activeSubtitleForKonva here
+                        const activeSubtitle = activeSubtitleForKonva;
+
+                        // If we are editing this subtitle, don't render the Konva version
+                        if (editingSubtitle?.id === activeSubtitle?.id) {
+                          return null;
+                        }
+
+                        if (!activeSubtitle?.text?.trim()) {
+                          return null; // Don't render anything if no active subtitle or text is empty
+                        }
+
+                        const konvaTextPadding = 10; // Renamed for clarity within Konva scope
+                        
+                        const tempTextNode = new Konva.Text({
+                            text: activeSubtitle.text,
+                            fontSize: 20,
+                            fontFamily: 'Arial',
+                            width: videoDimensions.width - (konvaTextPadding * 4),
+                            padding: konvaTextPadding,
+                            align: 'center',
+                        });
+                        const textHeight = tempTextNode.height();
+                        const textWidth = tempTextNode.width(); 
+                        
+                        const rectHeight = textHeight;
+                        const rectWidth = Math.max(textWidth, videoDimensions.width * 0.4);
+                        
+                        const rectX = (videoDimensions.width - rectWidth) / 2; 
+                        const rectY = videoDimensions.height - rectHeight - (konvaTextPadding * 2);
+
+                        const handleDoubleClick = () => {
+                            console.log('[VideoPlayerWithKonva] handleDoubleClick triggered');
+                            // activeSubtitle here refers to the one derived from activeSubtitleForKonva
+                            console.log('[VideoPlayerWithKonva] activeSubtitle on double-click:', activeSubtitle);
+                            if (!activeSubtitle) return;
+
+                            const editPayload = {
+                                id: activeSubtitle.id,
+                                text: activeSubtitle.text,
+                                x: rectX,
+                                y: rectY,
+                                width: rectWidth,
+                                height: rectHeight,
+                            };
+                            console.log('[VideoPlayerWithKonva] Setting editingSubtitle with:', editPayload);
+                            setEditingSubtitle(editPayload);
+                        };
+
+                        return (
+                          <Group
+                            listening={true}
+                            onDblClick={handleDoubleClick}
+                          >
+                            <Rect
+                              x={rectX}
+                              y={rectY}
+                              width={rectWidth}
+                              height={rectHeight}
+                              fill="rgba(0,0,0,0.7)"
+                              cornerRadius={8}
+                              shadowColor="black"
+                              shadowBlur={5}
+                              shadowOpacity={0.5}
+                              listening={true}
+                            />
+                            <Text
+                              text={activeSubtitle.text}
+                              x={rectX}
+                              y={rectY}
+                              fontSize={20}
+                              fontFamily="Arial"
+                              fill="white"
+                              width={rectWidth}
+                              height={rectHeight}
+                              padding={konvaTextPadding} 
+                              align="center"
+                              verticalAlign="middle"
+                              listening={true} 
+                            />
+                          </Group>
+                        );
+                      })()}
                     </Layer>
                   </Stage>
                 </div>
+              )}
+              {/* HTML Textarea for Editing Subtitles - MOVED HERE */}
+              {editingSubtitle && (
+                <textarea
+                  value={editingSubtitle.text}
+                  onChange={(e) => setEditingSubtitle(prev => prev ? { ...prev, text: e.target.value } : null)}
+                  onKeyDown={handleEditKeyDown}
+                  onBlur={handleEditSave}
+                  style={{
+                    position: 'absolute',
+                    left: `${editingSubtitle.x}px`,
+                    top: `${editingSubtitle.y}px`,
+                    width: `${editingSubtitle.width}px`,
+                    height: `${editingSubtitle.height}px`,
+                    backgroundColor: 'rgba(0,0,0,0.75)',
+                    color: 'white',
+                    border: '2px solid #60a5fa', // Tailwind blue-400
+                    borderRadius: '8px',
+                    fontSize: '20px',
+                    fontFamily: 'Arial',
+                    textAlign: 'center',
+                    padding: `10px`, // Use a fixed value or a component-level const
+                    boxSizing: 'border-box',
+                    zIndex: 100, 
+                    resize: 'none',
+                    overflow: 'hidden', 
+                  }}
+                  autoFocus
+                  onFocus={(e) => e.target.select()} 
+                />
               )}
             </div>
           </div>
