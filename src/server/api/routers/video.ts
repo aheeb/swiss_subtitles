@@ -12,12 +12,14 @@ import { Buffer } from 'buffer'; // Import Buffer for conversion
 import { Readable } from 'stream'; // Import Readable for stream conversion
 
 // Add imports for video export functionality
-import tmp from 'tmp-promise';
+import { file as tmpFile } from 'tmp-promise';
+import type { FileResult } from 'tmp-promise';
 import * as fs from 'fs/promises';
 import ffmpeg from 'fluent-ffmpeg';
 // Remove direct import of ffmpeg-static
 // import ffmpegPath from 'ffmpeg-static';
 import { generateAss } from '~/utils/generateAss';
+import { renderSubtitleToPng, buildOverlayFilterComplex } from '~/utils/generatePng';
 import path from 'path';
 
 // Need to import child_process properly
@@ -334,50 +336,85 @@ export const videoRouter = createTRPCRouter({
           // Continue anyway, it might already be executable
         }
 
-        // 1. Create temporary files
-        const tmpIn = await tmp.file({ postfix: '.mp4' });
-        const tmpAss = await tmp.file({ postfix: '.ass' });
-        const tmpOut = await tmp.file({ postfix: '.mp4' });
+        // 1. Create temporary input and output files
+        const tmpIn = await tmpFile({ postfix: '.mp4' });
+        const tmpOut = await tmpFile({ postfix: '.mp4' });
 
-        // 2. Write video and ASS subtitle files
+        // 2. Write video file
         await fs.writeFile(tmpIn.path, Buffer.from(input.videoB64, 'base64'));
         
         // Get actual video dimensions
         const videoDimensions = await getVideoSize(tmpIn.path);
         console.log('[ffmpeg] Video dimensions:', videoDimensions);
-        console.log('[ffmpeg] Input style for generateAss:', JSON.stringify(input.style, null, 2)); // Log input.style
+        console.log('[ffmpeg] Input style:', JSON.stringify(input.style, null, 2)); 
         
-        // Generate ASS subtitle file with correct dimensions
-        const assContent = generateAss(
-          input.subs, 
-          input.style, 
-          videoDimensions.width, 
+        // 3. Render each subtitle as a PNG file
+        const pngPaths: string[] = [];
+        for (const sub of input.subs) {
+          const pngPath = await renderSubtitleToPng(
+            sub,
+            input.style,
+            videoDimensions.width,
+            videoDimensions.height
+          );
+          pngPaths.push(pngPath);
+        }
+        
+        console.log(`[ffmpeg] Generated ${pngPaths.length} PNG subtitle files`);
+        
+        // 4. Build the filter complex string for FFmpeg
+        const filterComplex = buildOverlayFilterComplex(
+          input.subs,
+          pngPaths,
+          input.style,
+          videoDimensions.width,
           videoDimensions.height
         );
-        console.log('[ffmpeg] Generated ASS content:\n', assContent); // Log generated assContent
-        await fs.writeFile(tmpAss.path, assContent);
-
-        // 3. Run FFmpeg to burn subtitles into video
+        
+        console.log('[ffmpeg] Filter complex:', filterComplex);
+        
+        // 5. Build FFmpeg command with input files
+        const ffmpegCommand = ffmpeg(tmpIn.path);
+        
+        // Add each PNG as an input
+        pngPaths.forEach(pngPath => {
+          ffmpegCommand.input(pngPath);
+        });
+        
+        // 6. Run FFmpeg with the filter complex to overlay PNGs at the right times
         await new Promise<void>((resolve, reject) => {
-          ffmpeg(tmpIn.path)
-            .videoFilter(`subtitles=${tmpAss.path.replace(/:/g, '\\:')}`)
+          ffmpegCommand
+            .complexFilter(filterComplex)
             .outputOptions(
-              '-c:a', 'copy',          // Copy audio stream without re-encoding
-              '-movflags', '+faststart' // Optimize for web streaming
+              '-map', `[v${input.subs.length}]`, // Map the last overlay output
+              '-map', '0:a?',                   // Map audio from the first input if present
+              '-c:a', 'copy',                  // Copy audio stream without re-encoding
+              '-c:v', 'libx264',               // Use H.264 codec
+              '-preset', 'medium',              // Balance between speed and quality
+              '-crf', '23',                     // Quality setting - lower is better
+              '-movflags', '+faststart'         // Optimize for web streaming
             )
             .save(tmpOut.path)
             .on('end', () => resolve())
             .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)));
         });
 
-        // 4. Read the result and return as base64
+        // 7. Read the result and return as base64
         const mp4Buffer = await fs.readFile(tmpOut.path);
         const base64Result = mp4Buffer.toString('base64');
 
-        // 5. Clean up temporary files
+        // 8. Clean up temporary files
         await tmpIn.cleanup();
-        await tmpAss.cleanup();
         await tmpOut.cleanup();
+        
+        // Also clean up PNG files
+        await Promise.all(pngPaths.map(async (pngPath) => {
+          try {
+            await fs.unlink(pngPath);
+          } catch (err) {
+            console.warn(`Could not delete temporary PNG file ${pngPath}:`, err);
+          }
+        }));
 
         return base64Result;
       } catch (error: unknown) {
