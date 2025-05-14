@@ -1,55 +1,46 @@
 import { z } from "zod";
 import { createTRPCRouter, publicProcedure } from "~/server/api/trpc";
-// Remove Vercel AI SDK transcribe import
-// import { experimental_transcribe as transcribe } from 'ai'; 
-// Add official OpenAI client import and toFile helper
 import OpenAI, { toFile } from 'openai';
-// Remove @ai-sdk/openai import as we use the official client now
-// import { createOpenAI } from '@ai-sdk/openai'; 
 import { getOpenAIConfig } from '~/config/env';
 import { TRPCError } from '@trpc/server';
-import { Buffer } from 'buffer'; // Import Buffer for conversion
-import { Readable } from 'stream'; // Import Readable for stream conversion
+import { Buffer } from 'buffer';
+import { Readable } from 'stream';
 
-// Add imports for video export functionality
 import { file as tmpFile } from 'tmp-promise';
 import type { FileResult } from 'tmp-promise';
 import * as fs from 'fs/promises';
-import ffmpeg from 'fluent-ffmpeg';
-// Remove direct import of ffmpeg-static
-// import ffmpegPath from 'ffmpeg-static';
-import { generateAss } from '~/utils/generateAss';
-import { renderSubtitleToPng, buildOverlayFilterComplex } from '~/utils/generatePng';
+import ffmpeg, { FfmpegCommand } from 'fluent-ffmpeg';
+import { renderSubtitleToPng, buildOverlayFilterComplex, splitSubtitleIntoWords, calculateSubtitleLayoutMetrics } from '~/utils/generatePng';
 import path from 'path';
-
-// Need to import child_process properly
 import { execSync } from 'child_process';
 
-// Create a helper function to get ffmpeg path at runtime
+import type { Subtitle } from '~/store/subtitleStore';
+import type { SubtitleStyle } from "~/app/_components/VideoPlayerWithKonva";
+
+interface WordTimestamp {
+  word: string;
+  start: number;
+  end: number;
+}
+
 async function getFfmpegPath(): Promise<string> {
   try {
-    // Try to dynamically import and handle different module formats
     const ffmpegStatic = await import('ffmpeg-static');
     const resolvedPath: unknown = typeof ffmpegStatic === 'string' 
       ? ffmpegStatic 
       : ffmpegStatic.default;
     
     if (typeof resolvedPath === 'string') {
-      // Check if the path exists and is accessible
       try {
         await fs.access(resolvedPath);
         console.log(`[ffmpeg] Found binary at dynamic import path: ${resolvedPath}`);
         return resolvedPath;
       } catch (err) {
         console.warn(`[ffmpeg] Dynamic import path not accessible: ${resolvedPath}`);
-        // Fall through to alternative methods
       }
     }
 
-    // If we get here, try alternative methods
-    // Method 1: Check if ffmpeg is in the PATH
     try {
-      // Use the properly imported execSync
       const pathFromWhich: string = execSync('which ffmpeg', { encoding: 'utf8' }).toString().trim();
       console.log(`[ffmpeg] Found system binary at: ${pathFromWhich}`);
       return pathFromWhich;
@@ -57,7 +48,6 @@ async function getFfmpegPath(): Promise<string> {
       console.warn('[ffmpeg] Could not find ffmpeg in PATH');
     }
 
-    // Method 2: Try common locations on Mac/Linux
     const commonPaths = [
       '/usr/bin/ffmpeg',
       '/usr/local/bin/ffmpeg',
@@ -70,14 +60,11 @@ async function getFfmpegPath(): Promise<string> {
         console.log(`[ffmpeg] Found binary at common path: ${commonPath}`);
         return commonPath;
       } catch {
-        // Continue to next path
       }
     }
-    
-    // Method 3: Try to resolve node_modules path directly
+
     const moduleRootPath = path.resolve(process.cwd(), 'node_modules', '.pnpm', 'ffmpeg-static@5.2.0');
     
-    // On macOS, the binary should be in specific locations based on OS
     let binaryPath: string | undefined;
     if (process.platform === 'darwin') {
       if (process.arch === 'arm64') {
@@ -101,7 +88,6 @@ async function getFfmpegPath(): Promise<string> {
       }
     }
     
-    // Method 4: Try direct node_modules path without pnpm
     try {
       const directPath = path.resolve(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg');
       await fs.access(directPath);
@@ -111,7 +97,6 @@ async function getFfmpegPath(): Promise<string> {
       console.warn('[ffmpeg] Direct node_modules path not accessible');
     }
     
-    // Method 5: For Mac users, check if ffmpeg is installed via Homebrew
     if (process.platform === 'darwin') {
       try {
         const homebrewPath = execSync('brew --prefix ffmpeg', { encoding: 'utf8' }).toString().trim();
@@ -133,14 +118,11 @@ async function getFfmpegPath(): Promise<string> {
   }
 }
 
-// Remove the FFmpeg-Binary registration from top-level code
-// ffmpeg.setFfmpegPath(ffmpegPath!);
-
-// Interface for the structure we want to return (start/end in seconds)
 export interface TranscriptionSegment {
   text: string;
   start: number; // start time in seconds
   end: number;   // end time in seconds
+  words?: WordTimestamp[]; // Add optional word timestamps array
 }
 
 // Define the expected structure for individual segments in OpenAI's verbose_json response
@@ -163,6 +145,7 @@ interface OpenAIVerboseJSONResponse {
   segments: OpenAISegment[];
   language: string;
   duration: number;
+  words?: WordTimestamp[]; // Add optional words array to the response type
 }
 
 // Remove interface related to Vercel SDK type inference
@@ -199,6 +182,52 @@ function getVideoSize(filePath: string): Promise<{width: number; height: number}
         height: videoStream.height
       });
     });
+  });
+}
+
+// Helper function to run a single FFmpeg batch
+async function runFfmpegBatch(
+  inputVideoPath: string,
+  pngPaths: string[],
+  subtitles: Subtitle[],
+  outputVideoPath: string,
+  style: SubtitleStyle, // Added style parameter
+  videoDimensions: { width: number; height: number } // Added videoDimensions
+): Promise<void> {
+  const filterComplex = buildOverlayFilterComplex(
+    subtitles,
+    pngPaths,
+    style, // Pass style
+    videoDimensions.width, // Pass video width
+    videoDimensions.height // Pass video height
+  );
+
+  return new Promise<void>((resolve, reject) => {
+    const command: FfmpegCommand = ffmpeg(inputVideoPath);
+    pngPaths.forEach(pngPath => command.input(pngPath));
+
+    // Corrected video mapping logic as per user feedback
+    const lastPngIndexInBatch = pngPaths.length - 1;
+    const mapVideoStreamName =
+    pngPaths.length > 0
+      ? `[v${pngPaths.length}]`  // <─ für N Overlays ist das letzte Label vN
+      : '0:v';
+    command
+      .complexFilter(filterComplex)
+      .outputOptions(
+        '-map', mapVideoStreamName, // Corrected mapping based on user guidance
+        '-map', '0:a?',
+        '-c:a', 'copy',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '23',
+        '-movflags', '+faststart'
+      )
+      .on('start', (cmd: string) => console.log(`[ffmpeg batch] Spawned with command: ${cmd}`))
+      .on('stderr', (line: string) => console.log(`[ffmpeg batch] stderr: ${line}`))
+      .save(outputVideoPath)
+      .on('end', () => resolve())
+      .on('error', (err: Error) => reject(err));
   });
 }
 
@@ -242,7 +271,7 @@ export const videoRouter = createTRPCRouter({
           model: 'whisper-1',
           file: uploadableAudioFile, // Pass the Uploadable file object
           response_format: 'verbose_json', // Request detailed response with segments
-          timestamp_granularities: ['segment'], // Request segment timestamps
+          timestamp_granularities: ['word', 'segment'],
         }) as unknown as OpenAIVerboseJSONResponse; // Assert to our expected response type
 
         console.log('response', response);
@@ -252,31 +281,45 @@ export const videoRouter = createTRPCRouter({
           console.error('Invalid transcript response type from OpenAI. Expected object with segments array, got:', typeof response, response);
           throw new Error('Invalid transcript response: Expected object with segments from OpenAI API.');
         }
+        
+        // Also log if words are missing, as they are crucial now
+        if (!Array.isArray(response.words)) {
+          console.warn('OpenAI response missing "words" array. Word-level timing will not be available.');
+        }
 
-        // 5. Map the returned segments (timestamps are already in seconds)
+        // 5. Map the returned segments and associate words
         const openAIsegments = response.segments;
+        const allWords = response.words ?? []; // Use empty array if words are missing
 
         // The verbose_json response segments have start/end in seconds, matching our interface
-        const segmentsInSeconds: TranscriptionSegment[] = openAIsegments.map((seg: OpenAISegment) => ({
-          text: seg.text.trim(), // Trim potential whitespace
-          start: seg.start,
-          end: seg.end,
-          // Other available fields in verbose_json segments: id, seek, tokens, temperature, avg_logprob, compression_ratio, no_speech_prob
-        }));
+        const segmentsWithWords: TranscriptionSegment[] = openAIsegments.map((seg: OpenAISegment) => {
+          // Find words that fall within this segment's time range
+          const segmentWords = allWords.filter(word => 
+             word.start >= seg.start && word.end <= seg.end
+          );
 
-        console.log('segmentsInSeconds', segmentsInSeconds);
+          return {
+            text: seg.text.trim(), // Trim potential whitespace
+            start: seg.start,
+            end: seg.end,
+            words: segmentWords.length > 0 ? segmentWords : undefined // Add words if found
+            // Other available fields in verbose_json segments can be added if needed
+          };
+        });
+
+        console.log('segmentsWithWords', segmentsWithWords);
 
         // Log if no segments were returned
-        if (segmentsInSeconds.length === 0 && response.text) {
+        if (segmentsWithWords.length === 0 && response.text) {
           console.log('Transcription returned 0 segments. Full text:', response.text);
-        } else if (segmentsInSeconds.length === 0) {
+        } else if (segmentsWithWords.length === 0) {
              console.log('Transcription returned 0 segments and no text.');
         }
         
         // Remove the previous console.log for sdkSegments
         // console.log('sdkSegments', sdkSegments); 
 
-        return segmentsInSeconds;
+        return segmentsWithWords; // Return the segments with associated words
       } catch (error: unknown) {
         let message = 'Unknown error during transcription';
         
@@ -307,7 +350,12 @@ export const videoRouter = createTRPCRouter({
         id: z.string(),
         text: z.string(),
         start: z.number(),
-        end: z.number()
+        end: z.number(),
+        words: z.array(z.object({
+          word: z.string(),
+          start: z.number(),
+          end: z.number()
+        })).optional()
       })),
       style: z.object({
         fontFamily: z.string(),
@@ -318,11 +366,16 @@ export const videoRouter = createTRPCRouter({
         borderRadius: z.number(),
         position: z.enum(['bottom', 'top', 'middle', 'custom']),
         customX: z.number().optional(),
-        customY: z.number().optional()
+        customY: z.number().optional(),
+        effectType: z.enum(['none', 'cumulativePopOn', 'wordByWord']).optional().default('none')
       })
     }))
     .mutation(async ({ input }) => {
       try {
+        console.log('[exportWithSubs] Received export request.'); // Log start
+        // Log the received font family
+        console.log(`[exportWithSubs] Received style.fontFamily: "${input.style.fontFamily}"`);
+
         // Set ffmpeg path at runtime
         const ffmpegPath = await getFfmpegPath();
         console.log('[ffmpeg] using binary at', ffmpegPath);
@@ -348,64 +401,153 @@ export const videoRouter = createTRPCRouter({
         console.log('[ffmpeg] Video dimensions:', videoDimensions);
         console.log('[ffmpeg] Input style:', JSON.stringify(input.style, null, 2)); 
         
-        // 3. Render each subtitle as a PNG file
+        // 3. Check if word-by-word effect is enabled
+        const effectType = input.style.effectType ?? 'none';
+        
+        console.log(`[ffmpeg] Using subtitle effect: ${effectType}`);
+        
+        // 4. Process subtitles based on effect type
+        const processedSubs: Subtitle[] = [];
         const pngPaths: string[] = [];
-        for (const sub of input.subs) {
-          const pngPath = await renderSubtitleToPng(
-            sub,
-            input.style,
-            videoDimensions.width,
-            videoDimensions.height
-          );
-          pngPaths.push(pngPath);
+        
+        if (effectType === 'none') {
+          // Standard rendering - one PNG per subtitle
+          for (const sub of input.subs) {
+            const pngPath = await renderSubtitleToPng(
+              sub,
+              input.style,
+              videoDimensions.width,
+              videoDimensions.height
+            );
+            pngPaths.push(pngPath);
+            processedSubs.push(sub);
+          }
+        } else {
+          // Word-by-word effects
+          for (const sub of input.subs) {
+            if (effectType === 'cumulativePopOn') {
+              // Cumulative effect: words appear one by one and stay
+              const wordSubtitles = splitSubtitleIntoWords(sub, effectType);
+              
+              // For each word segment, create a PNG that's sized for the full subtitle
+              // but only contains text up to the current word
+              const fullLayoutMetrics = calculateSubtitleLayoutMetrics(
+                sub.text,
+                input.style,
+                videoDimensions.width,
+                videoDimensions.height
+              );
+              
+              for (const wordSub of wordSubtitles) {
+                // Calculate layout for this partial text (for proper word wrapping)
+                const partialLayoutMetrics = calculateSubtitleLayoutMetrics(
+                  wordSub.text,
+                  input.style,
+                  videoDimensions.width,
+                  videoDimensions.height
+                );
+                
+                // Render PNG with fixed canvas size from the full subtitle
+                const pngPath = await renderSubtitleToPng(
+                  wordSub,
+                  input.style,
+                  videoDimensions.width,
+                  videoDimensions.height,
+                  {
+                    overrideLayoutMetrics: partialLayoutMetrics,
+                    fixedCanvasSize: {
+                      width: fullLayoutMetrics.boxWidth,
+                      height: fullLayoutMetrics.boxHeight
+                    }
+                  }
+                );
+                
+                pngPaths.push(pngPath);
+                processedSubs.push(wordSub);
+              }
+            } else if (effectType === 'wordByWord') {
+              // Individual word effect: each word appears and disappears
+              const wordSubtitles = splitSubtitleIntoWords(sub, effectType);
+              
+              for (const wordSub of wordSubtitles) {
+                // Render each word as its own PNG
+                const pngPath = await renderSubtitleToPng(
+                  wordSub,
+                  input.style,
+                  videoDimensions.width,
+                  videoDimensions.height
+                );
+                
+                pngPaths.push(pngPath);
+                processedSubs.push(wordSub);
+              }
+            }
+          }
         }
         
         console.log(`[ffmpeg] Generated ${pngPaths.length} PNG subtitle files`);
         
-        // 4. Build the filter complex string for FFmpeg
-        const filterComplex = buildOverlayFilterComplex(
-          input.subs,
-          pngPaths,
-          input.style,
-          videoDimensions.width,
-          videoDimensions.height
-        );
-        
-        console.log('[ffmpeg] Filter complex:', filterComplex);
-        
-        // 5. Build FFmpeg command with input files
-        const ffmpegCommand = ffmpeg(tmpIn.path);
-        
-        // Add each PNG as an input
-        pngPaths.forEach(pngPath => {
-          ffmpegCommand.input(pngPath);
-        });
-        
-        // 6. Run FFmpeg with the filter complex to overlay PNGs at the right times
-        await new Promise<void>((resolve, reject) => {
-          ffmpegCommand
-            .complexFilter(filterComplex)
-            .outputOptions(
-              '-map', `[v${input.subs.length}]`, // Map the last overlay output
-              '-map', '0:a?',                   // Map audio from the first input if present
-              '-c:a', 'copy',                  // Copy audio stream without re-encoding
-              '-c:v', 'libx264',               // Use H.264 codec
-              '-preset', 'medium',              // Balance between speed and quality
-              '-crf', '23',                     // Quality setting - lower is better
-              '-movflags', '+faststart'         // Optimize for web streaming
-            )
-            .save(tmpOut.path)
-            .on('end', () => resolve())
-            .on('error', (err) => reject(new Error(`FFmpeg error: ${err.message}`)));
-        });
+        // --- BATCH PROCESSING LOGIC ---
+        const BATCH_SIZE = 200; // As suggested
+        let currentVideoPath = tmpIn.path;
+        let previousBatchTmpFile: FileResult | null = null; // To manage cleanup of intermediate tmpFile objects
 
-        // 7. Read the result and return as base64
-        const mp4Buffer = await fs.readFile(tmpOut.path);
+        if (processedSubs.length > 0) {
+          for (let i = 0; i < processedSubs.length; i += BATCH_SIZE) {
+            const batchSubs = processedSubs.slice(i, i + BATCH_SIZE);
+            const batchPngs = pngPaths.slice(i, i + BATCH_SIZE);
+
+            if (batchSubs.length === 0) { // Should not happen if processedSubs.length > 0 initially
+              continue;
+            }
+
+            const currentBatchOutputTmpFile = await tmpFile({ postfix: '.mp4' });
+
+            console.log(`[ffmpeg] Processing batch: ${i / BATCH_SIZE + 1}, subtitles: ${batchSubs.length}`);
+            await runFfmpegBatch(
+              currentVideoPath,
+              batchPngs,
+              batchSubs,
+              currentBatchOutputTmpFile.path,
+              input.style,
+              videoDimensions,
+            );
+
+            if (previousBatchTmpFile) {
+              await previousBatchTmpFile.cleanup(); // Clean up the intermediate file from the PREVIOUS batch
+            } else if (currentVideoPath !== tmpIn.path && i > 0) {
+              // Fallback: if currentVideoPath was an intermediate but not tracked by previousBatchTmpFile (should not happen with correct logic)
+              // This case is more to handle the user's direct suggestion: if (i > 0) await fs.unlink(currentVid);
+              // However, tmp-promise files are best cleaned with .cleanup()
+              // For simplicity and to align with tmp-promise, previousBatchTmpFile handles it.
+            }
+            
+            currentVideoPath = currentBatchOutputTmpFile.path;
+            previousBatchTmpFile = currentBatchOutputTmpFile; // This file will be cleaned up in the next iteration or after the loop
+          }
+        }
+        
+        // After the loop, currentVideoPath is the path to the final processed video
+        // and previousBatchTmpFile is its FileResult object (if any batches ran)
+
+        // 8. Read the result and return as base64
+        // The final video is at currentVideoPath
+        const mp4Buffer = await fs.readFile(currentVideoPath);
         const base64Result = mp4Buffer.toString('base64');
 
-        // 8. Clean up temporary files
-        await tmpIn.cleanup();
-        await tmpOut.cleanup();
+        // 9. Clean up temporary files
+        await tmpIn.cleanup(); // Original input video temp file
+        // tmpOut is not used if batching occurs and produces intermediate files.
+        // The final video (currentVideoPath) is managed by previousBatchTmpFile if batches ran.
+        if (previousBatchTmpFile) {
+          await previousBatchTmpFile.cleanup(); // Clean up the final video output file if it was created by a batch
+        } else if (currentVideoPath !== tmpIn.path) {
+          // This case should ideally not be hit if previousBatchTmpFile is managed correctly.
+          // It means currentVideoPath is an intermediate file not from tmpIn and not tracked by previousBatchTmpFile.
+          // For safety, try to unlink if it's a path we generated but didn't cleanup.
+          // However, relying on previousBatchTmpFile.cleanup() is safer for tmp-promise files.
+          // If no batches ran, currentVideoPath is tmpIn.path, which is already cleaned by tmpIn.cleanup().
+        }
         
         // Also clean up PNG files
         await Promise.all(pngPaths.map(async (pngPath) => {

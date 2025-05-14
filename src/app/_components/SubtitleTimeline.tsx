@@ -1,13 +1,21 @@
 "use client";
 
 import React, { useRef, useMemo, useState, useEffect } from 'react';
-import { useSubtitleStore } from '~/store/subtitleStore';
+import { useSubtitleStore, type Subtitle } from '~/store/subtitleStore';
 import { Play, ZoomIn, ZoomOut, Mic } from 'lucide-react'; // Added Mic icon
 import { VideoThumbnailStrip } from './VideoThumbnailStrip';
 import { api } from "~/trpc/react";
 import type { TranscriptionSegment } from "~/server/api/routers/video";
 
-// --- START: Audio processing functions (moved from server) ---
+// Define the expected structure for segments coming from the backend
+interface TranscriptionSegmentFromBackend {
+  text: string;
+  start: number;
+  end: number;
+  words?: Array<{ word: string; start: number; end: number }>;
+}
+
+// --- START: Restore Audio processing functions ---
 /**
  * Helper to write ASCII strings into DataView.
  */
@@ -86,14 +94,6 @@ async function extractCompressedAudioFromVideo(
   // 3. Encode samples as 16-bit PCM WAV
   return encodeWav(samples, targetRate);
 }
-// --- END: Audio processing functions ---
-
-const formatTimeRuler = (timeInSeconds: number): string => {
-    const minutes = Math.floor(timeInSeconds / 60);
-    const seconds = Math.floor(timeInSeconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-};
-
 // Helper function to convert ArrayBuffer to Base64
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   let binary = '';
@@ -104,6 +104,13 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   }
   return window.btoa(binary);
 }
+// --- END: Restore Audio processing functions ---
+
+const formatTimeRuler = (timeInSeconds: number): string => {
+    const minutes = Math.floor(timeInSeconds / 60);
+    const seconds = Math.floor(timeInSeconds % 60);
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
 
 interface SubtitleTimelineProps {
     currentTime: number;
@@ -208,16 +215,20 @@ export function SubtitleTimeline({
     const MAX_ZOOM = 200; // 200px per second
     
     const transcribeMutation = api.video.transcribe.useMutation({
-        onSuccess: (data: TranscriptionSegment[]) => {
-            addSubtitles(data.map((segment, index) => ({
-                id: `transcribed-${index}`,
+        onSuccess: (data: TranscriptionSegmentFromBackend[]) => {
+            console.log('Transcription successful:', data);
+            // Generate unique IDs for each subtitle segment
+            const newSubtitles: Subtitle[] = data.map((segment, index) => ({
+                id: `sub-${Date.now()}-${index}`,
                 text: segment.text,
                 start: segment.start,
-                end: segment.end
-            })));
+                end: segment.end,
+                words: segment.words // Pass the words array directly
+            }));
+            addSubtitles(newSubtitles);
         },
         onError: (error) => {
-            console.error('Failed to transcribe video:', error.message);
+            console.error('Transcription failed:', error);
             // Here you might want to show an error message to the user
         },
     });

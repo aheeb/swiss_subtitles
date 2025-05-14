@@ -1,11 +1,20 @@
 import { create } from 'zustand';
 
+// --- START: Define WordTimestamp structure ---
+interface WordTimestamp {
+  word: string;
+  start: number;
+  end: number;
+}
+// --- END: Define WordTimestamp structure ---
+
 // Define the structure of a subtitle item
 export interface Subtitle {
   id: string;
   text: string;
   start: number; // Time in seconds
   end: number;   // Time in seconds
+  words?: WordTimestamp[]; // Optional array of word timestamps
   // Add other properties like style, position later if needed
 }
 

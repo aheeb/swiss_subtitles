@@ -19,6 +19,7 @@ export interface SubtitleStyle {
   position: 'bottom' | 'top' | 'middle' | 'custom';
   customX?: number; // Optional custom X position
   customY?: number; // Optional custom Y position
+  effectType?: 'none' | 'cumulativePopOn' | 'wordByWord'; // Optional effect type for word-by-word animations
 }
 
 // Define font options
@@ -80,10 +81,17 @@ const BORDER_RADIUS_RANGE = {
 
 // Define position options
 const POSITION_OPTIONS = [
-  { id: 'bottom', name: 'Bottom', value: 'bottom' },
-  { id: 'middle', name: 'Middle', value: 'middle' },
-  { id: 'top', name: 'Top', value: 'top' },
-  { id: 'custom', name: 'Custom (Drag)', value: 'custom' },
+  { id: 'bottom', name: 'Bottom', value: 'bottom' as const },
+  { id: 'middle', name: 'Middle', value: 'middle' as const },
+  { id: 'top', name: 'Top', value: 'top' as const },
+  { id: 'custom', name: 'Custom (Drag)', value: 'custom' as const },
+];
+
+// Define effect type options
+const EFFECT_OPTIONS = [
+  { id: 'none', name: 'Standard', value: 'none' as const },
+  { id: 'cumulativePopOn', name: 'Type Writer', value: 'cumulativePopOn' as const },
+  { id: 'wordByWord', name: 'Word by Word', value: 'wordByWord' as const },
 ];
 
 // Default style
@@ -95,6 +103,7 @@ const DEFAULT_STYLE: SubtitleStyle = {
   bgOpacity: 1,    // Use fully opaque background by default
   borderRadius: 8,
   position: 'bottom',
+  effectType: 'none', // Default to no effect
 };
 
 // Helper function to format time
@@ -453,7 +462,6 @@ export function VideoPlayerWithKonva() {
                   <Stage width={videoDimensions.width} height={videoDimensions.height}>
                     <Layer>
                       {(() => {
-                        // Use the memoized/state-tracked activeSubtitleForKonva here
                         const activeSubtitle = activeSubtitleForKonva;
 
                         // If we are editing this subtitle, don't render the Konva version
@@ -465,10 +473,41 @@ export function VideoPlayerWithKonva() {
                           return null; // Don't render anything if no active subtitle or text is empty
                         }
 
-                        const konvaTextPadding = 10; // Renamed for clarity within Konva scope
+                        let textForKonva = activeSubtitle.text; // Default to full text
+
+                        // --- START: Typewriter effect logic for Konva --- 
+                        if (
+                          currentStyle.effectType === 'cumulativePopOn' &&
+                          activeSubtitle.words &&
+                          activeSubtitle.words.length > 0
+                        ) {
+                          const visibleWords = activeSubtitle.words.filter(
+                            (word) => currentTime >= word.start
+                          );
+                          if (visibleWords.length > 0) {
+                            textForKonva = visibleWords.map((w) => w.word).join(' ');
+                          } else {
+                            // If no words are "active" yet for typewriter,
+                            // render nothing initially for this effect.
+                            textForKonva = ''; 
+                          }
+                        }
+                        // --- END: Typewriter effect logic for Konva ---
+
+                        // If, after typewriter logic, the text is empty, don't render the group.
+                        // This prevents an empty box from showing before the first word appears in typewriter mode.
+                        if (!textForKonva.trim() && currentStyle.effectType === 'cumulativePopOn') {
+                            return null;
+                        }
+                        // Also, if the original text was empty and no effect, don't render.
+                        if (!textForKonva.trim() && !activeSubtitle.words) {
+                            return null;
+                        }
+
+                        const konvaTextPadding = 10;
                         
                         const tempTextNode = new Konva.Text({
-                            text: activeSubtitle.text,
+                            text: textForKonva, // Use the potentially modified textForKonva
                             fontSize: currentStyle.fontSize,
                             fontFamily: currentStyle.fontFamily,
                             width: videoDimensions.width - (konvaTextPadding * 4),
@@ -568,7 +607,7 @@ export function VideoPlayerWithKonva() {
                               />
                             )}
                             <Text
-                              text={activeSubtitle.text}
+                              text={textForKonva} // Use the potentially modified textForKonva
                               x={0}
                               y={0}
                               fontSize={currentStyle.fontSize}
@@ -840,7 +879,7 @@ export function VideoPlayerWithKonva() {
                       {POSITION_OPTIONS.map(position => (
                         <button
                           key={position.id}
-                          onClick={() => updateStyleProperty('position', position.value as 'bottom' | 'top' | 'middle' | 'custom')}
+                          onClick={() => updateStyleProperty('position', position.value)}
                           className={`p-2 rounded border text-sm ${
                             currentStyle.position === position.value
                               ? 'border-blue-500 bg-blue-500/20 text-white'
@@ -857,8 +896,33 @@ export function VideoPlayerWithKonva() {
                       </p>
                     )}
                   </div>
-
-                  {/* Border Radius Selection - Replace with slider */}
+                  
+                  {/* Animation Effect Selection */}
+                  <div>
+                    <label className="block text-sm font-medium text-white/80 mb-1">Animation Effect</label>
+                    <div className="grid grid-cols-1 gap-2">
+                      {EFFECT_OPTIONS.map(option => (
+                        <button
+                          key={option.id}
+                          className={`text-sm p-2 rounded border ${
+                            (currentStyle.effectType ?? 'none') === option.value 
+                              ? 'border-blue-500 bg-blue-500/20 text-white' 
+                              : 'border-white/10 hover:bg-white/5 text-white/80'
+                          }`}
+                          onClick={() => updateStyleProperty('effectType', option.value)}
+                        >
+                          {option.name}
+                        </button>
+                      ))}
+                    </div>
+                    {currentStyle.effectType !== 'none' && (
+                      <p className="text-xs text-white/60 mt-1">
+                        This effect will be applied when exporting the video.
+                      </p>
+                    )}
+                  </div>
+                  
+                  {/* Border Radius Selection */}
                   <div>
                     <div className="flex justify-between items-center mb-1">
                       <label className="block text-sm font-medium text-white/80">Border Radius</label>
@@ -878,7 +942,7 @@ export function VideoPlayerWithKonva() {
                       <span>Round</span>
                     </div>
                   </div>
-
+                  
                   {/* Preview */}
                   <div className="mt-2 p-3 rounded bg-black/50 border border-white/10">
                     <p className="text-xs text-white/70 mb-2">Preview:</p>
