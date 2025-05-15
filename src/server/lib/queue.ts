@@ -6,7 +6,7 @@ import IORedis from 'ioredis';
 // Ensure your Redis server is running and accessible.
 // This default configuration connects to localhost:6379.
 // For production, you'll likely use environment variables for these settings.
-const connection = new IORedis(process.env.REDIS_URL || 'redis://localhost:6379', {
+const connection = new IORedis(process.env.REDIS_URL ?? 'redis://localhost:6379', {
   maxRetriesPerRequest: null, // Important for BullMQ
 });
 

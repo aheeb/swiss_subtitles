@@ -3,10 +3,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Stage, Layer, Rect, Text, Group } from 'react-konva'; // Import Konva components
 import Konva from 'konva'; // Import the Konva namespace for direct constructor use
-import { Play, Pause, Settings, Type, PaintBucket, Layout, Download } from 'lucide-react'; // Added Download icon
+import { Play, Pause, Settings, Type, PaintBucket, Layout, Download, Loader2, AlertTriangle, CheckCircle2 } from 'lucide-react'; // Added more icons
 import { SubtitleTimeline } from './SubtitleTimeline'; // Import the timeline component
 import { useSubtitleStore } from '~/store/subtitleStore'; // Import the subtitle store
-import { useExport } from '~/utils/useExport'; // Import the export hook
+import { api } from "~/trpc/react"; // Import tRPC API
 
 // Define subtitle style options
 export interface SubtitleStyle {
@@ -20,6 +20,23 @@ export interface SubtitleStyle {
   customX?: number; // Optional custom X position
   customY?: number; // Optional custom Y position
   effectType?: 'none' | 'cumulativePopOn' | 'wordByWord'; // Optional effect type for word-by-word animations
+}
+
+// Define an interface for the expected job status response
+// This should mirror the return type of the `getJobStatus` tRPC query
+interface JobStatusResponse {
+  jobId: string | null;
+  status: string | null; // e.g., 'waiting', 'active', 'completed', 'failed', 'delayed'
+  isActive: boolean;
+  isWaiting: boolean;
+  isCompleted: boolean;
+  isFailed: boolean;
+  progress: number | object | null;
+  returnValue: string | null; // Expecting Base64 string for video
+  failedReason: string | null;
+  timestamp: number | null;
+  processedOn: number | null;
+  finishedOn: number | null;
 }
 
 // Define font options
@@ -130,11 +147,56 @@ export function VideoPlayerWithKonva() {
   // Video file reference for export
   const [videoFile, setVideoFile] = useState<File | null>(null);
 
+  // States for background job handling
+  const [exportJobId, setExportJobId] = useState<string | null>(null);
+  const [exportStatus, setExportStatus] = useState<string | null>(null); // e.g., 'processing', 'completed', 'failed'
+  const [exportProgress, setExportProgress] = useState<number | object | null>(null);
+  const [exportResult, setExportResult] = useState<string | null>(null); // Base64 video data
+  const [exportError, setExportError] = useState<string | null>(null);
+
   const subtitles = useSubtitleStore((state) => state.subtitles);
   const updateSubtitleText = useSubtitleStore((state) => state.updateSubtitle); // Get update function
 
-  // Export functionality
-  const { runExport, isLoading: isExporting } = useExport();
+  // tRPC mutation for starting the export
+  const exportVideoMutation = api.video.exportWithSubs.useMutation();
+
+  // tRPC query for polling job status
+const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatus.useQuery(
+  exportJobId ? { jobId: exportJobId } : ({} as any),   // never undefined
+    {
+      enabled: !!exportJobId && (exportStatus !== 'completed' && exportStatus !== 'failed'), // Only run if jobId exists and job not finished
+      refetchInterval: (query) => {
+        const data = query.state.data as JobStatusResponse | undefined;
+        const status = data?.status;
+        if (status === 'completed' || status === 'failed') {
+          return false; // Stop polling if completed or failed
+        }
+        return 3000; // Poll every 3 seconds otherwise
+      },
+      refetchOnWindowFocus: false,
+    }
+  );
+
+  // Effect to update local state based on job status polling result
+  useEffect(() => {
+    const data = jobStatusData as JobStatusResponse | undefined;
+    if (data) {
+      setExportStatus(data.status ?? null);
+      setExportProgress(data.progress ?? null);
+      if (data.isCompleted && typeof data.returnValue === 'string') {
+        setExportResult(data.returnValue);
+        setExportJobId(null);
+      } else if (data.isCompleted && data.returnValue !== null) {
+        // Handle cases where returnValue is not a string but job is complete (e.g. error object or unexpected type)
+        console.warn('Export job completed but returnValue is not a string:', data.returnValue);
+        setExportError('Export completed with unexpected result type.');
+        setExportJobId(null);
+      } else if (data.isFailed) {
+        setExportError(data.failedReason ?? 'Unknown export error');
+        setExportJobId(null);
+      }
+    }
+  }, [jobStatusData]);
 
   // State for inline editing of subtitles on the video
   const [editingSubtitle, setEditingSubtitle] = useState<{
@@ -393,15 +455,75 @@ export function VideoPlayerWithKonva() {
     );
   };
 
-  // Add handleExport function
+  // Handle video export
   const handleExport = async () => {
-    if (!videoFile || !subtitles.length) return;
-    
+    if (!videoFile) {
+      alert("Please select a video file first.");
+      return;
+    }
+    // Check if the mutation is pending or if there's an active job ID from a previous attempt that hasn't cleared yet
+    if (exportVideoMutation.isPending || exportJobId) { 
+      alert("An export is already in progress or finishing up. Please wait.");
+      return;
+    }
+
+    setExportJobId(null);
+    setExportStatus('starting');
+    setExportProgress(null);
+    setExportResult(null);
+    setExportError(null);
+
     try {
-      await runExport(videoFile, subtitles, currentStyle);
+      console.log("[handleExport] Reading video file...");
+      const videoB64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          // console.log("[handleExport] FileReader result (data URL):", result); // For debugging if needed
+          if (result && result.includes(',')) {
+            const base64Part = result.split(',')[1];
+            if (base64Part && base64Part.length > 0) { // Check if not empty
+              console.log("[handleExport] Extracted Base64 data (first 30 chars):", base64Part.substring(0, 30));
+              resolve(base64Part);
+            } else {
+              console.error("[handleExport] Empty Base64 part after split from data URL:", result);
+              reject(new Error("Failed to extract Base64 data from video file (empty string after split)."));
+            }
+          } else {
+            console.error("[handleExport] Invalid or missing Data URL from FileReader:", result);
+            reject(new Error("Failed to read video file as a valid Data URL (missing comma or data)."));
+          }
+        };
+        reader.onerror = (event) => {
+          console.error("[handleExport] FileReader error:", event.target?.error);
+          reject(new Error(event.target?.error?.message ?? 'FileReader error reading file.'));
+        };
+        reader.readAsDataURL(videoFile); // videoFile is checked for nullity above
+      });
+
+      console.log("[handleExport] Base64 data obtained, calling mutation...");
+      const mutationResult = await exportVideoMutation.mutateAsync({
+        videoB64,
+        subs: subtitles,
+        style: currentStyle,
+      });
+
+      if (mutationResult.success && mutationResult.jobId) {
+        setExportJobId(mutationResult.jobId);
+        setExportStatus('queued');
+        console.log("[handleExport] Export job started with ID:", mutationResult.jobId);
+      } else {
+        // This case should ideally be handled by mutateAsync throwing an error for non-success from tRPC
+        // but as a fallback:
+        console.error("[handleExport] Failed to start export job, API response indicates failure:", mutationResult);
+        throw new Error(mutationResult.message || 'Failed to start export job (API response).');
+      }
     } catch (error) {
-      console.error('Export failed:', error);
-      // Here you could add toast notifications or other UI feedback
+      console.error("[handleExport] Error during export process:", error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      setExportError(`Export process failed: ${errorMessage}`);
+      setExportStatus('failed');
+      setExportJobId(null); // Clear job ID on error
     }
   };
 
@@ -704,23 +826,42 @@ export function VideoPlayerWithKonva() {
             {/* Export button */}
             <button
               onClick={handleExport}
-              disabled={isExporting || !videoFile || !subtitles.length}
+              disabled={exportStatus === 'processing' || !videoFile || !subtitles.length}
               className={`text-white p-1.5 hover:bg-white/20 rounded-full transition-colors duration-150 ${
-                isExporting ? 'bg-indigo-500/50 animate-pulse' : ''
+                exportStatus === 'processing' ? 'bg-indigo-500/50 animate-pulse' : ''
               } ${!videoFile || !subtitles.length ? 'opacity-50 cursor-not-allowed' : ''}`}
               aria-label="Export video with subtitles"
               title="Export video with subtitles"
             >
-              <Download size={20} />
+              { (exportVideoMutation.isPending || (!!exportJobId && exportStatus !== 'completed' && exportStatus !== 'failed')) 
+                ? <Loader2 size={20} className="animate-spin" /> 
+                : <Download size={20} />
+              }
             </button>
           </div>
 
-          {/* Export Progress Overlay */}
-          {isExporting && (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 z-50">
-              <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-indigo-500 mb-4"></div>
-              <p className="text-white font-medium">Rendering video with subtitles...</p>
-              <p className="text-white/70 text-sm mt-2">This may take a few moments</p>
+          {/* Export Status Display */}
+          {(exportJobId ?? exportError ?? exportResult) && (
+            <div className="mt-2 p-3 rounded-md shadow-lg border border-white/10 bg-[#252526] text-white text-sm w-full">
+              {exportVideoMutation.isPending && <p><Loader2 className="inline mr-2 animate-spin" size={16} />Initiating export...</p>}
+              {exportStatus === 'queued' && <p><Loader2 className="inline mr-2 animate-spin" size={16} />Export queued. Waiting for worker...</p>}
+              {jobStatusData?.isActive && <p><Loader2 className="inline mr-2 animate-spin" size={16} />Processing video... {typeof jobStatusData.progress === 'number' ? `(${jobStatusData.progress}%)` : ''}</p>}
+              {exportResult && (
+                <div className="flex items-center">
+                  <CheckCircle2 className="inline mr-2 text-green-400" size={16} />
+                  Export successful!
+                  <a 
+                    href={`data:video/mp4;base64,${exportResult}`}
+                    download={videoFile?.name ? `${videoFile.name.split('.')[0]}_with_subtitles.mp4` : "video_with_subtitles.mp4"}
+                    className="ml-3 px-3 py-1 bg-blue-500 hover:bg-blue-600 rounded text-white text-xs transition-colors"
+                  >
+                    Download Video
+                  </a>
+                </div>
+              )}
+              {exportError && (
+                <p className="flex items-center"><AlertTriangle className="inline mr-2 text-red-400" size={16} />Error: {exportError}</p>
+              )}
             </div>
           )}
 
