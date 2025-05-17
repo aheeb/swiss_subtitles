@@ -155,8 +155,15 @@ async function runFfmpegBatch(
     command
       .complexFilter(filterComplex)
       .outputOptions(
-        '-map', mapVideoStreamName, '-map', '0:a?', '-c:a', 'copy',
-        '-c:v', 'libx264', '-preset', 'medium', '-crf', '23', '-movflags', '+faststart'
+        '-map', mapVideoStreamName,
+        '-map', '0:a?',
+        '-c:a', 'copy',
+        '-c:v', 'libx264',
+        '-preset', 'medium',
+        '-crf', '23',
+        '-movflags', '+faststart',
+        '-threads', '0',
+        '-filter_complex_threads', '0'
       )
       .on('start', (cmd: string) => console.log(`[Worker][ffmpeg batch] Spawned with command: ${cmd}`))
       .on('stderr', (line: string) => console.log(`[Worker][ffmpeg batch] stderr: ${line}`))
@@ -209,31 +216,41 @@ async function processVideoExport(job: Job<VideoExportJobData, string, string>):
     console.log(`[Worker][ffmpeg] Using subtitle effect: ${effectType}`);
 
     const processedSubsForFfmpeg: Subtitle[] = [];
-    const currentPngBatchPaths: string[] = []; // PNGs for the current ffmpeg batch
+    // currentPngBatchPaths and allPngPaths will be populated after Promise.all resolves
+    const pngGenerationPromises: Promise<string>[] = [];
 
     if (effectType === 'none') {
       for (const sub of subs) {
-        const pngPath = await renderSubtitleToPng(sub, style, videoDimensions.width, videoDimensions.height);
-        currentPngBatchPaths.push(pngPath);
-        allPngPaths.push(pngPath);
-        processedSubsForFfmpeg.push(sub);
+        processedSubsForFfmpeg.push(sub); // Keep track of the subtitle for ffmpeg
+        pngGenerationPromises.push(
+          renderSubtitleToPng(sub, style, videoDimensions.width, videoDimensions.height)
+        );
       }
     } else {
       for (const sub of subs) {
         const wordSubtitles = splitSubtitleIntoWords(sub, effectType);
         const fullLayoutMetrics = calculateSubtitleLayoutMetrics(sub.text, style, videoDimensions.width, videoDimensions.height);
         for (const wordSub of wordSubtitles) {
+          processedSubsForFfmpeg.push(wordSub); // Keep track of the word-subtitle for ffmpeg
           const partialLayoutMetrics = calculateSubtitleLayoutMetrics(wordSub.text, style, videoDimensions.width, videoDimensions.height);
-          const pngPath = await renderSubtitleToPng(wordSub, style, videoDimensions.width, videoDimensions.height, {
-            overrideLayoutMetrics: partialLayoutMetrics,
-            fixedCanvasSize: { width: fullLayoutMetrics.boxWidth, height: fullLayoutMetrics.boxHeight }
-          });
-          currentPngBatchPaths.push(pngPath);
-          allPngPaths.push(pngPath);
-          processedSubsForFfmpeg.push(wordSub);
+          pngGenerationPromises.push(
+            renderSubtitleToPng(wordSub, style, videoDimensions.width, videoDimensions.height, {
+              overrideLayoutMetrics: partialLayoutMetrics,
+              fixedCanvasSize: { width: fullLayoutMetrics.boxWidth, height: fullLayoutMetrics.boxHeight }
+            })
+          );
         }
       }
     }
+    
+    console.log(`[Worker][ffmpeg] Starting concurrent generation of ${pngGenerationPromises.length} PNG subtitle files...`);
+    const generatedPngPaths = await Promise.all(pngGenerationPromises);
+    
+    // Populate currentPngBatchPaths and allPngPaths with the results
+    // The order is preserved by Promise.all, aligning with processedSubsForFfmpeg
+    const currentPngBatchPaths = [...generatedPngPaths];
+    allPngPaths.push(...generatedPngPaths); // Add to allPngPaths for cleanup
+
     console.log(`[Worker][ffmpeg] Generated ${currentPngBatchPaths.length} PNG subtitle files`);
 
     const BATCH_SIZE = 200;

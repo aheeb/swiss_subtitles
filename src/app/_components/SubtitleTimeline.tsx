@@ -130,7 +130,8 @@ export function SubtitleTimeline({
     const updateSubtitleTime = useSubtitleStore((state) => state.updateSubtitle); // Renamed for clarity
     const timelineRef = useRef<HTMLDivElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
-    const zoomAnchorRef = useRef<{ time: number; mouseX: number } | null>(null); // Ref to store zoom anchor point
+    const playheadRef = useRef<HTMLDivElement>(null); // <-- Add ref for playhead
+    const [zoomOrigin, setZoomOrigin] = useState<{ timeAtMouse: number; mouseX: number } | null>(null); // <-- Add this state
     
     // State for drag operations
     const [activeDrag, setActiveDrag] = useState<{
@@ -144,6 +145,46 @@ export function SubtitleTimeline({
     // Zoom state (pixels per second)
     const [pixelsPerSecond, setPixelsPerSecond] = useState(50);
     const timelineWidth = duration * pixelsPerSecond;
+
+    // Effect to auto-scroll timeline to keep playhead in view
+    useEffect(() => {
+        if (containerRef.current && playheadRef.current && duration > 0) {
+            const container = containerRef.current;
+            const playhead = playheadRef.current;
+
+            const containerRect = container.getBoundingClientRect();
+            const playheadRect = playhead.getBoundingClientRect();
+
+            // Calculate playhead position relative to the container's visible area
+            // playhead.offsetLeft gives the position relative to the start of the scrollable content
+            const playheadOffsetLeft = playhead.offsetLeft;
+            const playheadWidth = playhead.offsetWidth; // typically small, like 2px for a line
+
+            const scrollLeft = container.scrollLeft;
+            const clientWidth = container.clientWidth;
+
+            const visibleAreaStart = scrollLeft;
+            const visibleAreaEnd = scrollLeft + clientWidth;
+
+            // Define a buffer zone (e.g., 50px from the edges) 
+            // to trigger scroll a bit before the playhead hits the absolute edge.
+            const buffer = 50; 
+
+            if (playheadOffsetLeft < visibleAreaStart + buffer || playheadOffsetLeft + playheadWidth > visibleAreaEnd - buffer) {
+                // Calculate the target scroll position to center the playhead
+                let targetScrollLeft = playheadOffsetLeft - (clientWidth / 2) + (playheadWidth / 2);
+
+                // Clamp the target scroll position to be within valid bounds
+                targetScrollLeft = Math.max(0, targetScrollLeft);
+                targetScrollLeft = Math.min(container.scrollWidth - clientWidth, targetScrollLeft);
+                
+                container.scrollTo({
+                    left: targetScrollLeft,
+                    behavior: 'smooth'
+                });
+            }
+        }
+    }, [currentTime, pixelsPerSecond, duration]); // Rerun when currentTime, zoom, or duration changes
 
     // Effect for handling global mouse move and up during drag operations
     useEffect(() => {
@@ -268,29 +309,23 @@ export function SubtitleTimeline({
 
         if (newPixelsPerSecond !== pixelsPerSecond) {
             // Store anchor point BEFORE updating state
-            zoomAnchorRef.current = { time: timeAtMouse, mouseX: mouseX };
+            setZoomOrigin({ timeAtMouse, mouseX }); // <-- Set zoom origin state
             setPixelsPerSecond(newPixelsPerSecond);
-
-            // DO NOT adjust scrollLeft here directly
-            // if (containerRef.current) {
-            //     const newScrollLeft = (timeAtMouse * newPixelsPerSecond) - mouseX;
-            //     containerRef.current.scrollLeft = newScrollLeft;
-            // }
         }
     };
 
     // Effect to adjust scroll AFTER zoom state changes and re-render
     useEffect(() => {
-        if (zoomAnchorRef.current && containerRef.current) {
-            const { time, mouseX } = zoomAnchorRef.current;
+        if (zoomOrigin && containerRef.current) {
+            const { timeAtMouse, mouseX } = zoomOrigin;
             // Calculate the new scroll position to keep the anchor time under the mouse
-            const newScrollLeft = (time * pixelsPerSecond) - mouseX;
+            const newScrollLeft = (timeAtMouse * pixelsPerSecond) - mouseX;
             containerRef.current.scrollLeft = Math.max(0, newScrollLeft); // Ensure scrollLeft isn't negative
 
             // Reset the anchor ref so this only runs once per zoom action
-            zoomAnchorRef.current = null;
+            setZoomOrigin(null);
         }
-    }, [pixelsPerSecond]); // Run this effect when pixelsPerSecond changes
+    }, [pixelsPerSecond, zoomOrigin]); // <-- Add zoomOrigin to dependencies
 
     // Add zoom event listeners (wheel)
     useEffect(() => {
@@ -511,6 +546,15 @@ export function SubtitleTimeline({
                             )}
                         </div>
                     </div>
+
+                    {/* Current time indicator line (Playhead) */}
+                    {duration > 0 && (
+                        <div
+                            ref={playheadRef} // <-- Assign ref to playhead
+                            className="absolute top-0 bottom-0 w-0.5 bg-yellow-400 z-20 pointer-events-none"
+                            style={{ left: `${(currentTime / duration) * timelineWidth}px` }}
+                        />
+                    )}
                 </div>
             </div>
         </div>

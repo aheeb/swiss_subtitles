@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { Stage, Layer, Rect, Text, Group } from 'react-konva'; // Import Konva components
 import Konva from 'konva'; // Import the Konva namespace for direct constructor use
-import { Play, Pause, Settings, Type, PaintBucket, Layout, Download, Loader2, AlertTriangle, CheckCircle2 } from 'lucide-react'; // Added more icons
+import { Play, Pause, Settings, Type, PaintBucket, Layout, Download, Loader2, AlertTriangle, CheckCircle2, VolumeX, Volume2, Undo2, Redo2 } from 'lucide-react'; // Added more icons and Undo2, Redo2
 import { SubtitleTimeline } from './SubtitleTimeline'; // Import the timeline component
 import { useSubtitleStore } from '~/store/subtitleStore'; // Import the subtitle store
 import { api } from "~/trpc/react"; // Import tRPC API
@@ -138,6 +138,7 @@ export function VideoPlayerWithKonva() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false); // To prevent timeupdate flicker during seek
+  const [isMuted, setIsMuted] = useState(true); // New state for mute
   
   // Subtitle style state
   const [currentStyle, setCurrentStyle] = useState<SubtitleStyle>(DEFAULT_STYLE);
@@ -153,16 +154,21 @@ export function VideoPlayerWithKonva() {
   const [exportProgress, setExportProgress] = useState<number | object | null>(null);
   const [exportResult, setExportResult] = useState<string | null>(null); // Base64 video data
   const [exportError, setExportError] = useState<string | null>(null);
+  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
 
   const subtitles = useSubtitleStore((state) => state.subtitles);
   const updateSubtitleText = useSubtitleStore((state) => state.updateSubtitle); // Get update function
+  const storeUndo = useSubtitleStore.getState().undo; // Get undo function directly
+  const storeRedo = useSubtitleStore.getState().redo; // Get redo function directly
+  const canUndo = useSubtitleStore((state) => state._canUndo());
+  const canRedo = useSubtitleStore((state) => state._canRedo());
 
   // tRPC mutation for starting the export
   const exportVideoMutation = api.video.exportWithSubs.useMutation();
 
   // tRPC query for polling job status
 const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatus.useQuery(
-  exportJobId ? { jobId: exportJobId } : ({} as any),   // never undefined
+  exportJobId ? { jobId: exportJobId } : ({ jobId: '""' } as { jobId: string }), // Use a valid but empty string to satisfy type, query is disabled anyway
     {
       enabled: !!exportJobId && (exportStatus !== 'completed' && exportStatus !== 'failed'), // Only run if jobId exists and job not finished
       refetchInterval: (query) => {
@@ -197,6 +203,26 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
       }
     }
   }, [jobStatusData]);
+
+  // Convert base64 export result to Blob URL to prevent freezing on download
+  useEffect(() => {
+    if (!exportResult) {
+      return;
+    }
+    // Decode base64 to binary data
+    const binary = atob(exportResult);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    // Create Blob and object URL
+    const blob = new Blob([bytes], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+    setDownloadUrl(url);
+    // Cleanup previous URL on change or unmount
+    return () => { URL.revokeObjectURL(url); };
+  }, [exportResult]);
 
   // State for inline editing of subtitles on the video
   const [editingSubtitle, setEditingSubtitle] = useState<{
@@ -381,6 +407,36 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
     };
   }, [videoUrl, isSeeking]); // Re-run if video changes or seeking state changes
 
+  // Effect for Keyboard Shortcuts (Undo/Redo)
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Prevent shortcuts if an input field or textarea is focused
+      const target = event.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') {
+        return;
+      }
+
+      if (event.ctrlKey || event.metaKey) {
+        if (event.key.toLowerCase() === 'z') {
+          event.preventDefault();
+          if (event.shiftKey) {
+            if (canRedo) storeRedo();
+          } else {
+            if (canUndo) storeUndo();
+          }
+        } else if (event.key.toLowerCase() === 'y') {
+          event.preventDefault();
+          if (canRedo) storeRedo();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [canUndo, canRedo, storeUndo, storeRedo]);
+
   // Update canvas size when video metadata is loaded or container resizes
   useEffect(() => {
     const FIXED_HEIGHT = 500; // Fixed height for the video player
@@ -480,9 +536,9 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
         reader.onload = () => {
           const result = reader.result as string;
           // console.log("[handleExport] FileReader result (data URL):", result); // For debugging if needed
-          if (result && result.includes(',')) {
+          if (result?.includes(',')) { // Optional chaining here
             const base64Part = result.split(',')[1];
-            if (base64Part && base64Part.length > 0) { // Check if not empty
+            if (base64Part && base64Part.length > 0) { // Check if base64Part is truthy and has length
               console.log("[handleExport] Extracted Base64 data (first 30 chars):", base64Part.substring(0, 30));
               resolve(base64Part);
             } else {
@@ -570,7 +626,7 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
                   objectFit: 'contain'
                 }}
                 className="block"
-                muted
+                muted={isMuted}
                 loop
               />
               {videoDimensions.width > 0 && videoDimensions.height > 0 && (
@@ -792,6 +848,16 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
               {isPlaying ? <Pause size={20} /> : <Play size={20} />}
             </button>
 
+            {/* Mute/Unmute Button */}
+            <button
+              onClick={() => setIsMuted(!isMuted)}
+              className="text-white p-1.5 hover:bg-white/20 rounded-full transition-colors duration-150"
+              aria-label={isMuted ? "Unmute" : "Mute"}
+              title={isMuted ? "Unmute" : "Mute"}
+            >
+              {isMuted ? <VolumeX size={20} /> : <Volume2 size={20} />}
+            </button>
+
             <span className="text-xs text-white/80 font-mono w-10 text-center">
                 {formatTime(currentTime)}
             </span>
@@ -823,6 +889,28 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
               <Settings size={20} />
             </button>
 
+            {/* Undo Button */}
+            <button
+              onClick={storeUndo}
+              disabled={!canUndo}
+              className={`text-white p-1.5 hover:bg-white/20 rounded-full transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed`}
+              aria-label="Undo"
+              title="Undo (Ctrl+Z)"
+            >
+              <Undo2 size={20} />
+            </button>
+
+            {/* Redo Button */}
+            <button
+              onClick={storeRedo}
+              disabled={!canRedo}
+              className={`text-white p-1.5 hover:bg-white/20 rounded-full transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed`}
+              aria-label="Redo"
+              title="Redo (Ctrl+Y or Ctrl+Shift+Z)"
+            >
+              <Redo2 size={20} />
+            </button>
+
             {/* Export button */}
             <button
               onClick={handleExport}
@@ -850,13 +938,15 @@ const { data: jobStatusData, refetch: refetchJobStatus } = api.video.getJobStatu
                 <div className="flex items-center">
                   <CheckCircle2 className="inline mr-2 text-green-400" size={16} />
                   Export successful!
-                  <a 
-                    href={`data:video/mp4;base64,${exportResult}`}
-                    download={videoFile?.name ? `${videoFile.name.split('.')[0]}_with_subtitles.mp4` : "video_with_subtitles.mp4"}
-                    className="ml-3 px-3 py-1 bg-blue-500 hover:bg-blue-600 rounded text-white text-xs transition-colors"
-                  >
-                    Download Video
-                  </a>
+                  {downloadUrl && (
+                    <a
+                      href={downloadUrl}
+                      download={videoFile?.name ? `${videoFile.name.split('.')[0]}_with_subtitles.mp4` : "video_with_subtitles.mp4"}
+                      className="ml-3 px-3 py-1 bg-blue-500 hover:bg-blue-600 rounded text-white text-xs transition-colors"
+                    >
+                      Download Video
+                    </a>
+                  )}
                 </div>
               )}
               {exportError && (
